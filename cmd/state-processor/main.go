@@ -313,14 +313,70 @@ func (p *stateProcessor) updateTransaction(ctx context.Context, evt *event.Event
 	connKey := fmt.Sprintf("charger:%s:conn:%d", evt.ChargerID, evt.ConnectorID)
 	chargerKey := fmt.Sprintf("charger:%s", evt.ChargerID)
 	pipe := p.rdb.Pipeline()
+
 	if evt.EventType == ocpp.ActionStartTransaction {
 		var req ocpp.StartTransactionReq
 		json.Unmarshal(evt.Payload, &req)
 		pipe.HSet(ctx, connKey, "active_transaction", "true", "tx_id_tag", req.IDTag)
 		pipe.SAdd(ctx, fmt.Sprintf("charger:%s:connectors", evt.ChargerID), fmt.Sprintf("%d", req.ConnectorID))
+
+		// Store start data for CDR pairing (keyed by charger only — StopTransaction has no connectorId)
+		txKey := fmt.Sprintf("tx:active:%s", evt.ChargerID)
+		pipe.HSet(ctx, txKey,
+			"start_time", evt.Timestamp.Format(time.RFC3339),
+			"meter_start", fmt.Sprintf("%d", req.MeterStart),
+			"id_tag", req.IDTag,
+			"connector_id", fmt.Sprintf("%d", req.ConnectorID),
+		)
+		pipe.Expire(ctx, txKey, 24*time.Hour)
 	} else {
-		pipe.HSet(ctx, connKey, "active_transaction", "false")
+		var req ocpp.StopTransactionReq
+		json.Unmarshal(evt.Payload, &req)
+
+		// Build CDR from Start+Stop pair
+		txKey := fmt.Sprintf("tx:active:%s", evt.ChargerID)
+		startData, _ := p.rdb.HGetAll(ctx, txKey).Result()
+
+		connID := 0
+		if startData["connector_id"] != "" {
+			fmt.Sscanf(startData["connector_id"], "%d", &connID)
+		}
+
+		// Mark the correct connector as inactive
+		if connID > 0 {
+			realConnKey := fmt.Sprintf("charger:%s:conn:%d", evt.ChargerID, connID)
+			pipe.HSet(ctx, realConnKey, "active_transaction", "false")
+		} else {
+			pipe.HSet(ctx, connKey, "active_transaction", "false")
+		}
+
+		if startData["start_time"] != "" {
+			startTime, _ := time.Parse(time.RFC3339, startData["start_time"])
+			meterStart := 0
+			fmt.Sscanf(startData["meter_start"], "%d", &meterStart)
+			duration := int(evt.Timestamp.Sub(startTime).Seconds())
+			energyWh := req.MeterStop - meterStart
+			if energyWh < 0 {
+				energyWh = 0
+			}
+			idTag := startData["id_tag"]
+			if req.IDTag != "" {
+				idTag = req.IDTag
+			}
+
+			sessionID := evt.EventID
+			p.db.ExecContext(ctx,
+				`INSERT INTO charge_sessions (session_id, charger_id, connector_id, id_tag, start_time, end_time, duration_sec, energy_wh, meter_start, meter_stop, stop_reason)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				 ON CONFLICT (session_id) DO NOTHING`,
+				sessionID, evt.ChargerID, connID, idTag,
+				startTime, evt.Timestamp, duration, energyWh,
+				meterStart, req.MeterStop, req.Reason,
+			)
+			pipe.Del(ctx, txKey)
+		}
 	}
+
 	pipe.HSet(ctx, chargerKey, "last_seen", evt.Timestamp.Format(time.RFC3339))
 	pipe.SAdd(ctx, "chargers", evt.ChargerID)
 	_, err := pipe.Exec(ctx)
@@ -343,6 +399,23 @@ func createTables(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_event_history_charger ON event_history (charger_id, event_timestamp DESC);
 		CREATE INDEX IF NOT EXISTS idx_event_history_type ON event_history (event_type, event_timestamp DESC);
 		CREATE INDEX IF NOT EXISTS idx_event_history_message ON event_history (message_id);
+
+		CREATE TABLE IF NOT EXISTS charge_sessions (
+			session_id      TEXT PRIMARY KEY,
+			charger_id      TEXT NOT NULL,
+			connector_id    INTEGER NOT NULL,
+			id_tag          TEXT NOT NULL DEFAULT '',
+			start_time      TIMESTAMPTZ NOT NULL,
+			end_time        TIMESTAMPTZ NOT NULL,
+			duration_sec    INTEGER NOT NULL,
+			energy_wh       INTEGER NOT NULL,
+			meter_start     INTEGER NOT NULL DEFAULT 0,
+			meter_stop      INTEGER NOT NULL DEFAULT 0,
+			stop_reason     TEXT NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ DEFAULT NOW()
+		);
+		CREATE INDEX IF NOT EXISTS idx_charge_sessions_time ON charge_sessions (end_time DESC);
+		CREATE INDEX IF NOT EXISTS idx_charge_sessions_charger ON charge_sessions (charger_id, end_time DESC);
 	`)
 	return err
 }

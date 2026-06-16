@@ -15,13 +15,17 @@
 5. [Kafka / MSK — Message Pipeline](#5-kafka--msk-message-pipeline)
 6. [Latest-State Store](#6-latest-state-store)
 7. [Idempotency & Out-of-Order Event Handling](#7-idempotency--out-of-order-event-handling)
-8. [Capacity Planning](#8-capacity-planning)
-9. [Disaster Recovery & Failover Scenarios](#9-disaster-recovery--failover-scenarios)
-10. [Charger Authentication & mTLS](#10-charger-authentication--mtls)
-11. [Key Design Decisions](#11-key-design-decisions)
-12. [Telemetry & Data Strategy](#12-telemetry--data-strategy)
-13. [Cost Estimate](#13-cost-estimate)
-14. [Open Issues & Out-of-Scope Topics](#14-open-issues--out-of-scope-topics)
+8. [Data Lifecycle — Message Fate](#8-data-lifecycle--message-fate)
+9. [OCPP Version Abstraction (1.6 vs 2.0.1)](#9-ocpp-version-abstraction-16-vs-201)
+10. [Multi-Tenancy](#10-multi-tenancy)
+11. [Capacity Planning](#11-capacity-planning)
+12. [Charger Authentication & Security Profiles](#12-charger-authentication--security-profiles)
+13. [Disaster Recovery & Failover Scenarios](#13-disaster-recovery--failover-scenarios)
+14. [Key Design Decisions](#14-key-design-decisions)
+15. [Telemetry & Data Strategy](#15-telemetry--data-strategy)
+16. [Cost Estimate](#16-cost-estimate)
+17. [Cloud Portability vs Lock-In](#17-cloud-portability-vs-lock-in)
+18. [Open Issues & Out-of-Scope Topics](#18-open-issues--out-of-scope-topics)
 
 ---
 
@@ -693,7 +697,316 @@ def handle_stop_transaction(event):
     update_latest_state(event.chargePointId, session_active=False)
 ```
 
-## 8. Capacity Planning
+### Hanging transactions (lost StopTransaction)
+
+In OCPP 1.6, `StartTransaction` and `StopTransaction` are an unpaired pair. If the `StopTransaction` is lost in transit (charger went offline at the wrong moment, message dropped), the session never closes — `session.active` stays `true` forever, the charger appears permanently busy, and no CDR is ever generated. This is the classic OCPP 1.6 "hanging transaction" problem.
+
+OCPP 2.0.1's event-based `TransactionEvent` model handles message loss more gracefully, but the platform must still defend against it for the 1.6 fleet.
+
+**Reconciliation job (scheduled, every 5 minutes):**
+
+```
+For each charger where latest-state.session.active == true:
+  if (now − lastMeterValue.timestamp) > 15 min
+     AND (now − connectivity.lastSeen) > 15 min:
+       → session is hanging
+       → synthesise a StopTransaction from last known meter reading
+       → generate CDR with stopReason = "Reconciled"
+       → flag CDR for billing review (estimated, not charger-confirmed)
+       → close session in latest-state
+```
+
+The synthesised CDR is marked `Reconciled` so billing can apply a different policy (e.g. estimate from last meter value, or hold for manual review) rather than treating it as a clean charger-confirmed stop. This prevents both permanently-stuck chargers and silent revenue loss.
+
+### Mass offline backfill
+
+When a charger loses connectivity, it does not stop working: it authorises users against a local list, runs sessions, and **queues meter values and transaction events locally**, flushing them to the CSMS on reconnect. This is normal OCPP behaviour, not an edge case.
+
+The consequence at fleet scale: after an AZ recovery or a wide network outage, thousands of chargers reconnect and flush hours of buffered events simultaneously — a large burst of **out-of-order, old-timestamp** events.
+
+```
+Charger offline 3 hours → reconnects → flushes ~180 buffered MeterValues
+                                         (ocppTimestamp = up to 3h old)
+```
+
+Handling:
+
+```
+1. Latest-state:   optimistic locking already protects it — old buffered
+                   events have old ingestedAt-equivalent ordering and are
+                   ignored for "current" state (the charger's live event wins).
+
+2. Timestream:     buffered events older than the 24h memory-store window
+                   cannot be written to the hot tier. The Stream Processor
+                   routes events with ocppTimestamp > 24h old to a
+                   batch path → Timestream magnetic store (or S3 directly).
+
+3. Kafka backpressure: the reconnect burst is absorbed by Kafka (it is built
+                   for this). Consumers drain at their own rate; WSGW applies
+                   per-charger ingest rate limiting so one charger flushing
+                   a huge backlog cannot starve others.
+
+4. Billing:        StopTransaction in the flushed batch carries the real
+                   meterStop — CDRs are computed correctly even though the
+                   events arrived late. Idempotency (messageId) prevents
+                   double-processing if the charger retries.
+```
+
+The key property: **late arrival affects when data lands, not whether it is correct**. History is timestamp-ordered by `ocppTimestamp`; billing uses transaction-boundary readings; latest-state uses ingest ordering. Each store has the right ordering authority for its purpose.
+
+## 8. Data Lifecycle — Message Fate
+
+This section consolidates what happens to each OCPP message type from ingestion to long-term storage. The guiding principle: **five distinct stores, each answering a different question, with no duplication**.
+
+### The five stores
+
+| Question | Store | Granularity | Retention | Mutability |
+|---|---|---|---|---|
+| "What is the charger doing right now?" | DynamoDB (latest-state) | 1 record per charger | Until next update | Overwrite |
+| "What happened during a session?" | RDS PostgreSQL + S3 (CDR) | 1 record per session | 2 years / 7 years | Immutable |
+| "What are the trends over time?" | Timestream (aggregates) | 1-min bins | 90 days | Append |
+| "Raw data for audit / ML / disputes" | S3 Parquet + Athena | Per event | Unlimited (Glacier) | Append |
+| "Transport buffer" | Kafka | Per event | 7–30 days | Stream |
+
+### Per-message-type fate
+
+**MeterValues** (~833/s for 50k chargers — the highest-volume type):
+```
+WSGW → Kafka (ocpp.meter_values, 7-day retention)
+         │
+         ├─► Stream Processor
+         │     ├─ 1-min aggregates → Timestream (90 days)
+         │     ├─ anomaly detection → SNS → NOC alerts
+         │     └─ live session state → Redis (TTL = session)
+         │
+         └─► S3 Sink → raw Parquet archive → Athena-queryable
+               (audit / ML / dispute resolution; Glacier after 90 days)
+
+WSGW → DynamoDB latest-state (last value only:
+        session.powerW, session.energyKwh, lastMeterValue)
+```
+
+**StatusNotification** (state changes — low volume, event-driven):
+```
+WSGW → Kafka (ocpp.status_notification, 3-day retention)
+         ├─► Alert Service (Faulted → PagerDuty)
+         └─► S3 archive (history / audit)
+WSGW → DynamoDB latest-state (ocppStatus, errorCode)
+```
+
+**StartTransaction / StopTransaction**:
+```
+WSGW → Kafka (ocpp.transactions, 30-day retention)
+         └─► Transaction Processor
+               on StopTransaction:
+               ├─ compute CDR
+               ├─ CDR → RDS PostgreSQL (active billing, 2 years)
+               ├─ CDR → S3 (archive, 7 years — EU requirement)
+               └─ clear session in DynamoDB latest-state
+WSGW → DynamoDB latest-state (session.active true/false)
+```
+
+**Heartbeat**:
+```
+WSGW → DynamoDB latest-state (connectivity.lastSeen) only
+        NOT published to Kafka — no value in storing keepalives
+```
+
+### Key insight: billing does not depend on raw MeterValues
+
+The OCPP `StopTransaction` message carries `meterStop` — the final meter register reading. Energy billed = `meterStop − meterStart`. **If the entire raw MeterValues archive were deleted tomorrow, billing would continue to work**, because the CDR is already computed from transaction boundary readings.
+
+Raw MeterValues are therefore not on the billing critical path. They exist for:
+- Dispute resolution ("why was I charged this amount?")
+- Predictive maintenance (power-curve analysis → hardware degradation)
+- ML / grid optimisation
+- Regulatory audit
+
+This justifies storing them in cheap S3 Parquet rather than a hot database.
+
+### Raw retention: design trade-off
+
+| Option | Approach | Pros | Cons |
+|---|---|---|---|
+| **A — Drop raw** | Aggregate → Timestream, discard raw | Cheapest, simplest | No reprocessing, no audit trail, no ML data |
+| **B — Archive raw** (chosen) | Aggregate → Timestream + raw → S3 Parquet | Reprocessing, audit, ML, disputes | +storage cost (see below) |
+
+**Chosen: Option B.** Raw archived to S3 Parquet (~10x compression vs JSON), transitioned to Glacier after 90 days. Aggregates only in Timestream/DynamoDB — never raw in a hot store.
+
+### S3 Parquet storage cost
+
+```
+Raw MeterValues volume (50k chargers):
+  ~833 msg/s × 86,400 s/day = ~72M events/day
+  JSON ~1 KB/event → ~72 GB/day raw JSON
+  Parquet compression ~10x → ~7.2 GB/day stored
+
+Monthly accumulation: ~216 GB/month
+
+S3 Standard (first 90 days):    216 GB × $0.023/GB  = ~$5/month per month of data
+S3 Glacier Flexible (90+ days): 216 GB × $0.0036/GB = ~$0.78/month per month of data
+
+Steady-state cost (rolling 90 days hot + Glacier tail):
+  Hot (3 months):    ~648 GB × $0.023 = ~$15/month
+  Glacier (rest):    accumulates ~$0.78/month per archived month
+  Year-1 total:      ~$25–35/month
+  Year-3 total:      ~$60–80/month (Glacier tail grows slowly)
+
+For 150k chargers: ~3x → ~$75–100/month at year 1
+```
+
+This is negligible relative to the ~$7,800/month base cost — which is precisely why archiving raw (Option B) is an easy decision.
+
+
+---
+
+## 9. OCPP Version Abstraction (1.6 vs 2.0.1)
+
+The platform must serve OCPP 1.6J and OCPP 2.0.1 chargers simultaneously. These versions are **not wire-compatible**: 2.0.1 has a completely different message structure (~100+ message types vs ~30), a hierarchical device model, and an event-based transaction model. The platform isolates this difference at the edge so that everything downstream is version-agnostic.
+
+### The problem
+
+```
+OCPP 1.6:                          OCPP 2.0.1:
+  flat ChargePoint → Connector       hierarchical ChargingStation
+  StartTransaction/StopTransaction    → EVSE → Connector → Component
+  ~30 message types                  TransactionEvent (Started/Updated/Ended)
+  key-value configuration            ~100+ message types
+                                     structured Device Model
+```
+
+If version specifics leak into Kafka topics, the latest-state model, or billing, every downstream consumer would need version-aware branching. That does not scale across teams.
+
+### Solution: version-aware dispatch at WSGW, canonical model downstream
+
+```
+Charger (1.6 or 2.0.1)
+  │ WebSocket subprotocol header declares version:
+  │ Sec-WebSocket-Protocol: ocpp1.6  |  ocpp2.0.1
+  ▼
+WSGW — version-aware dispatcher
+  ├── OCPP 1.6 adapter  ──┐
+  ├── OCPP 2.0.1 adapter ─┤── normalise to canonical internal event
+  │                       ▼
+  │              Canonical Event Schema (version-agnostic)
+  ▼
+Kafka / DynamoDB / downstream — all version-agnostic
+```
+
+The WebSocket subprotocol header carries the version identifier during the handshake; WSGW selects the correct adapter per connection.
+
+### Canonical event schema
+
+Each adapter maps version-specific messages onto a shared internal representation. Downstream consumers never see raw OCPP — only this canonical form:
+
+```json
+{
+  "eventType": "SESSION_METER",      // canonical, not OCPP-specific
+  "chargePointId": "CP-007",
+  "evseId": "1",
+  "connectorId": "1",
+  "ocppVersion": "2.0.1",            // preserved for traceability
+  "timestamp": "2026-06-15T14:23:00Z",
+  "payload": {
+    "energyKwh": 12.3,
+    "powerW": 7200
+  },
+  "messageId": "uuid",
+  "ingestedAt": "2026-06-15T14:23:00.123Z",
+  "sequenceNumber": 1847
+}
+```
+
+### Canonical event types (examples)
+
+| Canonical type | OCPP 1.6 source | OCPP 2.0.1 source |
+|---|---|---|
+| `SESSION_STARTED` | StartTransaction | TransactionEvent (Started) |
+| `SESSION_METER` | MeterValues | TransactionEvent (Updated) / MeterValues |
+| `SESSION_ENDED` | StopTransaction | TransactionEvent (Ended) |
+| `STATUS_CHANGED` | StatusNotification | StatusNotification |
+| `CONNECTIVITY` | Heartbeat / BootNotification | Heartbeat / BootNotification |
+
+### Why this matters as a platform
+
+- Billing, telemetry, and latest-state are written once, against the canonical schema — no per-version code paths
+- Adding OCPP 2.1 later means writing **one new adapter**, not touching downstream
+- The hierarchical 2.0.1 device model (EVSE → Connector → Component) maps cleanly onto `evseId` / `connectorId` fields; 1.6's flat model fills the same fields with defaults
+- The OCPP 2.0.1 event-based transaction model also fixes the "hanging transaction" problem (see §10) — the adapter exploits this where available
+
+
+---
+
+## 10. Multi-Tenancy
+
+Spirii operates a CSMS platform used by many Charge Point Operators (CPOs), each with their own chargers, tariffs, customers, and dashboards. The platform is multi-tenant by design — a single charger belongs to exactly one tenant, and no tenant can see another's data.
+
+### Tenancy model
+
+```
+Tenant (CPO)
+  └── Locations
+        └── Charge Boxes
+              └── EVSEs
+                    └── Connectors
+```
+
+This mirrors the entity hierarchy exposed by the Spirii public API (Location → Charge Box → EVSE → Connector), with **Tenant** as the top-level isolation boundary.
+
+### Isolation strategy: pooled infrastructure, partitioned data
+
+The platform uses **shared infrastructure with tenant-scoped data** — not separate stacks per tenant. This keeps the Cloud team from operating N copies of everything while guaranteeing data isolation.
+
+| Layer | Isolation mechanism |
+|---|---|
+| WSGW connections | Charger cert/credentials carry `tenantId`; resolved at handshake |
+| DynamoDB latest-state | PK = `{tenantId}#{chargePointId}` |
+| Kafka topics | Shared topics; `tenantId` in every event; partition key `{tenantId}#{chargePointId}` |
+| RDS (CDR, billing) | `tenant_id` column + row-level security (RLS) policies |
+| S3 data lake | Prefix per tenant: `s3://.../tenant={id}/year=/month=/` |
+| API access | JWT carries `tenantId`; every query scoped server-side |
+| Dashboards | Tenant-scoped RBAC |
+
+### How tenant identity flows
+
+```
+1. Charger authenticates (Profile 2/3)
+   → cert SAN or Basic Auth username encodes tenantId
+   → WSGW resolves tenantId at connection time, attaches to session
+
+2. Every event WSGW emits carries tenantId
+   → Kafka, DynamoDB, S3 writes all tenant-tagged
+
+3. API requests carry tenantId in JWT claims
+   → API layer injects tenant filter into every query
+   → never trusts a tenantId from the request body
+```
+
+### Holding the isolation line
+
+The critical risk in pooled multi-tenancy is a missing tenant filter leaking cross-tenant data. Defences:
+
+```
+- DynamoDB: tenantId is part of the PK — physically impossible to
+  read another tenant's item without their tenantId
+- RDS: PostgreSQL Row-Level Security enforced at the database,
+  not in application code — a forgotten WHERE clause still can't leak
+- S3: IAM policies scope each tenant's data access by prefix
+- Kafka: consumers filter by tenantId; sensitive per-tenant streams
+  can use separate topics where stronger isolation is required
+- Contract tests in CI assert that no query path omits tenant scoping
+```
+
+Row-Level Security and PK-embedded tenancy mean isolation is enforced by infrastructure, not by developer discipline — which is what makes it safe as a platform other teams build on.
+
+### When to escalate to silo isolation
+
+Pooled is the default. A tenant with regulatory or scale requirements (e.g. a very large CPO, or one requiring data residency in a specific region) can be moved to a **dedicated silo** — separate DynamoDB tables, RDS instance, or even a separate cell — without changing the application code, because the tenant boundary is already explicit everywhere.
+
+
+---
+
+## 11. Capacity Planning
 
 ### Resource matrix
 
@@ -730,7 +1043,108 @@ NLB:   connection draining 300s on pod deregistration
 
 ---
 
-## 9. Disaster Recovery & Failover Scenarios
+## 12. Charger Authentication & Security Profiles
+
+OCPP defines standardised **Security Profiles** rather than leaving authentication to implementers. The platform speaks in these terms because charger vendors and procurement specify compliance by profile number.
+
+### OCPP Security Profiles
+
+| Profile | Transport | Authentication | Use |
+|---|---|---|---|
+| **Profile 1** | Unsecured (`ws://`) | HTTP Basic Auth (username + password) | Test/lab only, or trusted network behind VPN |
+| **Profile 2** | TLS (`wss://`) | Server certificate + HTTP Basic Auth | Production minimum |
+| **Profile 3** | TLS (`wss://`) | Mutual TLS (server + client certificates) + message signing | Public infrastructure (recommended) |
+
+Only one profile is active per charger at a time; chargers can be upgraded to a stronger profile over their lifetime. Profile 3 in OCPP 2.0.1/2.1 mandates TLS 1.3 and certificate-based mutual authentication.
+
+### Platform stance
+
+```
+New chargers (OCPP 2.0.1+):  Profile 3 (mTLS)  — default for all new installs
+Production fleet (OCPP 1.6): Profile 2 (TLS + Basic Auth) — practical minimum
+Lab / commissioning:         Profile 1 — never in production
+```
+
+Profile 1 is never permitted on the public ingress. Where legacy hardware supports only Basic Auth, it runs Profile 2 (TLS at minimum) — never Profile 1 over the open internet.
+
+### TLS termination
+
+NLB operates in **TCP passthrough** mode — it does not terminate TLS. This is required for Profile 3: client-certificate verification must happen at the application layer where the CA trust store lives.
+
+```
+Charger
+  │  TLS ClientHello (+ client certificate for Profile 3)
+  ▼
+NLB  (TCP passthrough — raw TLS forwarded, no termination)
+  │
+  ▼
+WSGW Pod
+  ├── Terminates TLS (TLS 1.3)
+  ├── Profile 2: validates Basic Auth credentials (from Secrets Manager)
+  ├── Profile 3: verifies client cert against ACM PCA trust store
+  ├── Extracts chargePointId from cert CN/SAN (P3) or URL path (P2)
+  └── Upgrades to WebSocket → OCPP session authenticated
+```
+
+### PKI infrastructure (Profile 3)
+
+```
+AWS Private CA (ACM PCA)
+└── Root CA (offline, HSM-backed)
+    └── Intermediate CA (online)
+        ├── Server certs  → WSGW pods / NLB
+        └── Client certs  → one per charger
+```
+
+For OCPP 2.1 compatibility, the CSMS provisions **two server certificates** (one RSA, one ECDSA) to support both cipher-suite families.
+
+### Certificate provisioning
+
+**At installation (commissioning):**
+```
+1. Installer triggers CSR generation on the charger
+2. CSR → Spirii Provisioning API → ACM PCA signs
+3. Signed cert returned, stored in charger secure storage
+4. Private key never leaves the device
+```
+
+**Via OCPP 2.0.1 CertificateManagement (in-band):**
+```
+CSMS → InstallCertificate.req  → charger installs CA cert
+Charger → SignCertificate.req  → sends CSR to CSMS
+CSMS → ACM PCA                 → signs CSR
+CSMS → CertificateSigned.req   → charger installs client cert
+```
+
+### Certificate expiry — the critical operational risk
+
+A charger with an expired certificate goes **completely offline** until renewed — it cannot reconnect at all. At fleet scale, certificate expiry without automated monitoring is the single most common OCPP 2.0.1 operational failure.
+
+Mitigations (mandatory, not optional):
+```
+1. ACM PCA expiry tracking → CloudWatch metric per cert
+2. Alert at 30 / 14 / 7 days before expiry → ops dashboard
+3. Automated rotation via OCPP CertificateManagement before expiry
+4. Monitor for SecurityEventNotification: DiscardedRenewedClientCertificate
+   (OCPP 2.1) — charger rejected a new cert and may need re-trigger
+5. Staggered rotation — never let large cohorts share an expiry date
+```
+
+The last point matters: if 5,000 chargers were commissioned the same week with 1-year certs, they expire the same week. Rotation must be staggered across the fleet to avoid a synchronised mass-offline event.
+
+### Secrets management
+
+```
+Profile 2 Basic Auth credentials:  AWS Secrets Manager (per-charger)
+TLS private keys (server):         ACM (auto-rotated)
+CA private keys:                   ACM PCA (HSM-backed, never exported)
+DB / Redis credentials:            Secrets Manager + IRSA (no static keys in pods)
+```
+
+
+---
+
+## 13. Disaster Recovery & Failover Scenarios
 
 ### Scenario 1 — WSGW Pod failure
 
@@ -827,92 +1241,7 @@ RTO:       0 (transparent to producers and consumers)
 
 ---
 
-## 10. Charger Authentication & mTLS
-
-### Threat model
-
-Without strong charger authentication, any client knowing the WebSocket URL can connect and inject fake OCPP messages — fake transactions, false meter values, or denial-of-service floods.
-
-### Authentication options
-
-| Method | How it works | Strength | Notes |
-|---|---|---|---|
-| One-way TLS | Server cert only; charger identified by `chargePointId` in URL | Low | Anyone knowing the URL can connect |
-| Basic Auth over TLS | `Authorization: Basic` header in WebSocket upgrade | Medium | OCPP 1.6 supported; password must be stored on charger |
-| **mTLS** | Both sides present certificates; CSMS verifies client cert against CA | **High** | OCPP 2.0.1 recommended; requires PKI infrastructure |
-
-### mTLS architecture
-
-```
-┌──────────────────────────────────────────────┐
-│           PKI Infrastructure                 │
-│                                              │
-│  AWS Private CA (ACM PCA)                   │
-│  └── Root CA (offline, HSM-backed)          │
-│      └── Intermediate CA (online)           │
-│          ├── Server cert  → WSGW pods       │
-│          └── Client certs → each charger    │
-└──────────────────────────────────────────────┘
-```
-
-### TLS termination
-
-NLB operates in **TCP passthrough** mode — it does not terminate TLS. TLS is terminated at the WSGW pod, which has access to the CA trust store for client certificate verification.
-
-```
-Charger
-  │  TLS ClientHello + client certificate
-  ▼
-NLB  (TCP passthrough — raw TLS forwarded)
-  │
-  ▼
-WSGW Pod
-  ├── Terminates TLS
-  ├── Verifies client cert against ACM PCA trust store
-  ├── Extracts chargePointId from cert CN or SAN field
-  └── Upgrades to WebSocket → OCPP session authenticated
-```
-
-### Certificate provisioning
-
-**At installation time:**
-```
-1. Installer triggers CSR generation on the charger
-2. CSR sent to Spirii Provisioning API
-3. ACM PCA signs the certificate
-4. Signed cert returned and stored in charger secure storage
-5. Charger private key never leaves the device
-```
-
-**Via OCPP 2.0.1 (for supported hardware):**
-```
-CSMS → InstallCertificate.req  → charger installs CA cert
-Charger → SignCertificate.req  → sends CSR to CSMS
-CSMS → ACM PCA                 → signs CSR
-CSMS → CertificateSigned.req   → charger installs client cert
-```
-
-### Certificate rotation
-
-```
-ACM PCA monitors expiry
-  → 30 days before expiry:
-      CSMS initiates rotation via OCPP CertificateManagement
-      or out-of-band provisioning API
-  → Charger installs new cert alongside existing one
-  → On next reconnect: new cert presented
-  → Old cert revoked in ACM PCA CRL / OCSP
-```
-
-### Compatibility note
-
-mTLS requires charger firmware support for client certificates. Legacy hardware (OCPP 1.6 only, older firmware) may support only Basic Auth. A hybrid approach is acceptable during migration:
-- New chargers (OCPP 2.0.1): mTLS
-- Legacy chargers (OCPP 1.6): Basic Auth over TLS + IP allowlisting where possible
-
----
-
-## 11. Key Design Decisions
+## 14. Key Design Decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
@@ -927,10 +1256,15 @@ mTLS requires charger firmware support for client certificates. Legacy hardware 
 | HPA scale-down window | 600s | Prevents rapid pod removal and thundering herd |
 | Kafka partition key | `chargePointId` | Guarantees per-charger event ordering for billing and telemetry |
 | Redis TTL | 300s (= heartbeat interval × 4) | Keys expire automatically if charger disconnects without cleanup |
+| Charger auth | OCPP Security Profile 3 (mTLS) default, Profile 2 for legacy | Speaks the standard's language; Profile 2 is the production minimum |
+| TLS termination | WSGW pod (not NLB) | Profile 3 client-cert verification needs the CA trust store at app layer |
+| Version handling | Adapter at WSGW → canonical event schema | Downstream is version-agnostic; OCPP 2.1 = one new adapter, no downstream change |
+| Multi-tenancy | Pooled infra, partitioned data (PK/RLS/prefix) | Isolation enforced by infrastructure, not developer discipline |
+| Raw MeterValues | Archive to S3 Parquet, not a hot DB | Not on billing critical path; cheap audit/ML/dispute store |
 
 ---
 
-## 12. Telemetry & Data Strategy
+## 15. Telemetry & Data Strategy
 
 This architecture covers the base infrastructure layer (WSGW, Kafka, Redis). The sections below describe how telemetry data flows downstream and what storage tier serves each use case.
 
@@ -1050,7 +1384,7 @@ This base infrastructure supports the following application-layer services, each
 
 ---
 
-## 13. Cost Estimate
+## 16. Cost Estimate
 
 All prices are AWS eu-west-1 on-demand rates as of June 2026. Reserved Instance or Savings Plans pricing reduces compute costs by approximately 30–40%.
 
@@ -1096,7 +1430,48 @@ All prices are AWS eu-west-1 on-demand rates as of June 2026. Reserved Instance 
 
 ---
 
-## 14. Open Issues & Out-of-Scope Topics
+## 17. Cloud Portability vs Lock-In
+
+This design picks **AWS deliberately** and uses managed services aggressively. That is a speed-and-operations choice, not an accident — but the lock-in is real and worth stating explicitly, along with the exit path for each component.
+
+### Lock-in by component
+
+| Component | AWS service | Lock-in | Portable alternative |
+|---|---|---|---|
+| Compute | EKS (Kubernetes) | Low | Any K8s — the WSGW container runs anywhere |
+| Load balancer | NLB | Low | Any L4 LB (cloud LB, MetalLB, HAProxy) |
+| Message bus | MSK (Kafka) | Low | Kafka is open — self-managed or Confluent/Aiven |
+| Latest-state | DynamoDB | **High** | ScyllaDB / Cassandra (similar model, portable) |
+| Stream processing | Kinesis Data Analytics | **High** | Apache Flink (KDA is managed Flink — code ports) |
+| Time-series | Timestream | **High** | InfluxDB / TimescaleDB |
+| Relational | RDS PostgreSQL | Low | PostgreSQL anywhere |
+| Object store | S3 | Medium | Any S3-compatible store (MinIO, GCS, R2) |
+| Ad-hoc query | Athena | Medium | Trino/Presto on the same Parquet files |
+| PKI | ACM PCA | Medium | Smallstep / HashiCorp Vault PKI |
+
+### The deliberate trade
+
+The portable core — Kubernetes, Kafka, PostgreSQL, Parquet on object storage — carries the **business-critical, hard-to-rebuild logic**: the WSGW gateway, the event pipeline, billing. These are the parts that would be expensive to rewrite, and they are intentionally kept on open foundations.
+
+The high-lock-in services — DynamoDB, Timestream, KDA — are chosen where the **managed-service operational savings are large and the replacement is a known quantity**. DynamoDB → ScyllaDB is a well-trodden migration (same wide-column model). KDA is managed Apache Flink, so the processing code itself is portable even though the runtime is not.
+
+### What I would NOT lock in
+
+If multi-cloud or exit risk were a hard requirement, the two services to drop first are **Timestream** (replace with TimescaleDB on the existing RDS footprint) and **DynamoDB** (replace with ScyllaDB on EKS). Both have portable, open equivalents that run in-cluster. The cost is more operational burden on the Cloud team — which is exactly the trade managed services buy back.
+
+### Why DynamoDB over ScyllaDB here
+
+| | DynamoDB | ScyllaDB |
+|---|---|---|
+| Ops burden | Zero (fully managed) | Self-operated cluster |
+| Latency | Single-digit ms | Sub-ms (often faster) |
+| Scaling | Automatic | Manual node management |
+| Portability | AWS-only | Runs anywhere |
+| Best when | Small platform team, AWS-committed | Multi-cloud, latency-critical, ops capacity exists |
+
+For a Cloud Platform team whose mandate is to **not become the bottleneck**, DynamoDB's zero-ops property is the deciding factor. ScyllaDB is the right answer if portability becomes a hard requirement or if the team has spare operational capacity and needs sub-millisecond reads.
+
+## 18. Open Issues & Out-of-Scope Topics
 
 The following items are relevant to a production deployment but are not covered in this document.
 
@@ -1123,4 +1498,4 @@ Not covered: distributed tracing (AWS X-Ray or OpenTelemetry), structured log ag
 
 ---
 
-*Version 1.3 — June 2026*
+*Version 1.6 — June 2026*

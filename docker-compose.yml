@@ -104,11 +104,14 @@ services:
         CMD: api
     environment:
       REDIS_ADDR: "redis:6379"
+      POSTGRES_DSN: "postgres://spirii:spirii@postgres:5432/spirii?sslmode=disable"
       LISTEN_ADDR: ":8081"
     ports:
       - "8081:8081"
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   cp-simulator:

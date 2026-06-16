@@ -31,6 +31,7 @@ Power.Active.Import = Current power draw (W)
 Current.Import = Current flowing to vehicle (A)
 
 ## Transaction & Auth
+CDR = Charge Detail Record (summary of a completed charging session: energy, duration, cost)
 idTag = Identifier tag (e.g. RFID card ID) used for authorization
 RFID = Radio-Frequency Identification
 

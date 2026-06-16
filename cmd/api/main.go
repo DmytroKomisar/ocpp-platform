@@ -2,19 +2,22 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"embed"
-	"io/fs"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
@@ -50,6 +53,7 @@ func init() {
 
 func main() {
 	redisAddr := getEnv("REDIS_ADDR", "redis:6379")
+	pgDSN := getEnv("POSTGRES_DSN", "postgres://spirii:spirii@postgres:5432/spirii?sslmode=disable")
 	listenAddr := getEnv("LISTEN_ADDR", ":8081")
 
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
@@ -63,11 +67,26 @@ func main() {
 		time.Sleep(time.Second)
 	}
 
-	api := &apiServer{rdb: rdb}
+	db, err := sql.Open("postgres", pgDSN)
+	if err != nil {
+		log.Printf("postgres connect warning (sessions will be unavailable): %v", err)
+	} else {
+		defer db.Close()
+		for i := 0; i < 30; i++ {
+			if err := db.Ping(); err == nil {
+				break
+			}
+			log.Printf("waiting for postgres... (%d/30)", i+1)
+			time.Sleep(time.Second)
+		}
+	}
+
+	api := &apiServer{rdb: rdb, db: db}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/chargers", api.listChargers)
 	mux.HandleFunc("/chargers/", api.getChargerState)
+	mux.HandleFunc("/sessions", api.listSessions)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
@@ -127,6 +146,21 @@ func main() {
 
 type apiServer struct {
 	rdb *redis.Client
+	db  *sql.DB
+}
+
+type ChargeSession struct {
+	SessionID   string `json:"session_id"`
+	ChargerID   string `json:"charger_id"`
+	ConnectorID int    `json:"connector_id"`
+	IDTag       string `json:"id_tag"`
+	StartTime   string `json:"start_time"`
+	EndTime     string `json:"end_time"`
+	DurationSec int    `json:"duration_sec"`
+	EnergyWh    int    `json:"energy_wh"`
+	MeterStart  int    `json:"meter_start"`
+	MeterStop   int    `json:"meter_stop"`
+	StopReason  string `json:"stop_reason"`
 }
 
 type ChargerState struct {
@@ -276,6 +310,70 @@ func (a *apiServer) buildChargerState(ctx context.Context, chargerID string) (*C
 	}
 
 	return state, nil
+}
+
+func (a *apiServer) listSessions(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	if r.Method != http.MethodGet {
+		apiRequestsTotal.WithLabelValues("list_sessions", "405").Inc()
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if a.db == nil {
+		apiRequestsTotal.WithLabelValues("list_sessions", "503").Inc()
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "database not available"})
+		return
+	}
+
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 && parsed <= 200 {
+			limit = parsed
+		}
+	}
+
+	chargerFilter := r.URL.Query().Get("charger_id")
+
+	var rows *sql.Rows
+	var err error
+	if chargerFilter != "" {
+		rows, err = a.db.QueryContext(r.Context(),
+			`SELECT session_id, charger_id, connector_id, id_tag, start_time, end_time, duration_sec, energy_wh, meter_start, meter_stop, stop_reason
+			 FROM charge_sessions WHERE charger_id = $1 ORDER BY end_time DESC LIMIT $2`, chargerFilter, limit)
+	} else {
+		rows, err = a.db.QueryContext(r.Context(),
+			`SELECT session_id, charger_id, connector_id, id_tag, start_time, end_time, duration_sec, energy_wh, meter_start, meter_stop, stop_reason
+			 FROM charge_sessions ORDER BY end_time DESC LIMIT $1`, limit)
+	}
+	if err != nil {
+		apiRequestsTotal.WithLabelValues("list_sessions", "500").Inc()
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	sessions := make([]ChargeSession, 0)
+	for rows.Next() {
+		var s ChargeSession
+		var startTime, endTime time.Time
+		if err := rows.Scan(&s.SessionID, &s.ChargerID, &s.ConnectorID, &s.IDTag,
+			&startTime, &endTime, &s.DurationSec, &s.EnergyWh,
+			&s.MeterStart, &s.MeterStop, &s.StopReason); err != nil {
+			continue
+		}
+		s.StartTime = startTime.Format(time.RFC3339)
+		s.EndTime = endTime.Format(time.RFC3339)
+		sessions = append(sessions, s)
+	}
+
+	apiRequestsTotal.WithLabelValues("list_sessions", "200").Inc()
+	apiRequestDuration.WithLabelValues("list_sessions").Observe(time.Since(start).Seconds())
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"count":    len(sessions),
+		"sessions": sessions,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
