@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fleet Monitor — Spirii</title>
+  <link rel="stylesheet" href="/dashboard/style.css">
+</head>
+<body>
+  <div class="header">
+    <div class="header-title">
+      <span class="logo">&#9889;</span>
+      <a href="/dashboard/" onclick="window.navigateToFleet(); return false;">Fleet Monitor</a>
+    </div>
+    <div class="header-right">
+      <div class="refresh-indicator">
+        <div class="refresh-dot"></div>
+        <span>Live</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="fleet-controls">
+    <div class="stats-bar">
+      <div class="stat-card">
+        <div class="stat-label">Total Chargers</div>
+        <div class="stat-value" id="stat-total">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Online</div>
+        <div class="stat-value green" id="stat-online">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Charging Now</div>
+        <div class="stat-value blue" id="stat-charging">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Total Power</div>
+        <div class="stat-value cyan" id="stat-power">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Total Energy</div>
+        <div class="stat-value" id="stat-energy">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Faulted</div>
+        <div class="stat-value green" id="stat-faulted">-</div>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <label>Filter:</label>
+      <select id="filter-status">
+        <option value="All">All</option>
+        <option value="Charging">Charging</option>
+        <option value="Available">Available</option>
+        <option value="Preparing">Preparing</option>
+        <option value="Finishing">Finishing</option>
+        <option value="Faulted">Faulted</option>
+        <option value="Unavailable">Unavailable</option>
+      </select>
+      <label>Sort:</label>
+      <select id="sort-by">
+        <option value="id">Charger ID</option>
+        <option value="status">Status</option>
+        <option value="power">Power (desc)</option>
+      </select>
+      <input type="text" id="search-box" placeholder="Search charger ID...">
+    </div>
+  </div>
+
+  <div id="app">
+    <div id="charger-grid" class="charger-grid">
+      <div class="loading">Loading fleet data...</div>
+    </div>
+  </div>
+
+  <script src="/dashboard/app.js"></script>
+</body>
+</html>

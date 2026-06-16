@@ -1,0 +1,252 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "OCPP Charger Telemetry API",
+    "description": "REST API for querying the latest known state of EV chargers. Part of the OCPP Charger Telemetry Platform built for the Spirii Cloud Platform Engineer challenge.",
+    "version": "1.0.0",
+    "contact": {
+      "name": "Spirii Platform Team"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8081",
+      "description": "Local development"
+    }
+  ],
+  "paths": {
+    "/chargers": {
+      "get": {
+        "summary": "List all chargers",
+        "description": "Returns the latest known state of all chargers in the fleet, including connector-level status and meter values.",
+        "operationId": "listChargers",
+        "tags": ["Chargers"],
+        "responses": {
+          "200": {
+            "description": "List of chargers with their latest state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": {
+                      "type": "integer",
+                      "description": "Number of chargers returned",
+                      "example": 5
+                    },
+                    "chargers": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/ChargerState" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error (Redis unavailable)"
+          }
+        }
+      }
+    },
+    "/chargers/{chargerId}": {
+      "get": {
+        "summary": "Get charger state",
+        "description": "Returns the latest known composite state of a single charger, including all connectors with status, meter values, and transaction info.",
+        "operationId": "getChargerState",
+        "tags": ["Chargers"],
+        "parameters": [
+          {
+            "name": "chargerId",
+            "in": "path",
+            "required": true,
+            "description": "Charge point ID (e.g. SPI-00001)",
+            "schema": {
+              "type": "string",
+              "example": "SPI-00001"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Charger state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ChargerState" }
+              }
+            }
+          },
+          "404": {
+            "description": "Charger not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": { "type": "string", "example": "charger not found" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/chargers/{chargerId}/state": {
+      "get": {
+        "summary": "Get charger state (alias)",
+        "description": "Alias for GET /chargers/{chargerId}. Returns the same composite state.",
+        "operationId": "getChargerStateAlias",
+        "tags": ["Chargers"],
+        "parameters": [
+          {
+            "name": "chargerId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "example": "SPI-00001" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Charger state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ChargerState" }
+              }
+            }
+          },
+          "404": {
+            "description": "Charger not found"
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "summary": "Health check",
+        "operationId": "healthCheck",
+        "tags": ["System"],
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "ok" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ChargerState": {
+        "type": "object",
+        "description": "Composite latest state of a charger, assembled from BootNotification, StatusNotification, MeterValues, and Transaction events.",
+        "properties": {
+          "charger_id": {
+            "type": "string",
+            "description": "Charge point identifier",
+            "example": "SPI-00001"
+          },
+          "vendor": {
+            "type": "string",
+            "description": "Charge point vendor (from BootNotification)",
+            "example": "Spirii"
+          },
+          "model": {
+            "type": "string",
+            "description": "Charge point model",
+            "example": "S3-50kW"
+          },
+          "serial": {
+            "type": "string",
+            "description": "Serial number",
+            "example": "SPI-00001"
+          },
+          "firmware": {
+            "type": "string",
+            "description": "Firmware version",
+            "example": "3.2.1"
+          },
+          "online": {
+            "type": "boolean",
+            "description": "Whether the charger is currently connected"
+          },
+          "last_seen": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp of the last received event"
+          },
+          "last_boot": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp of the last BootNotification"
+          },
+          "connectors": {
+            "type": "array",
+            "description": "State of each connector on this charger",
+            "items": { "$ref": "#/components/schemas/ConnectorState" }
+          }
+        }
+      },
+      "ConnectorState": {
+        "type": "object",
+        "description": "Latest state of a single connector, assembled from StatusNotification and MeterValues.",
+        "properties": {
+          "connector_id": {
+            "type": "integer",
+            "description": "OCPP connector ID (1-based)",
+            "example": 1
+          },
+          "status": {
+            "type": "string",
+            "description": "Current connector status (OCPP ChargePointStatus)",
+            "enum": ["Available", "Preparing", "Charging", "SuspendedEV", "SuspendedEVSE", "Finishing", "Reserved", "Unavailable", "Faulted"],
+            "example": "Charging"
+          },
+          "error_code": {
+            "type": "string",
+            "description": "Current error code (OCPP ChargePointErrorCode)",
+            "example": "NoError"
+          },
+          "status_timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp of the last StatusNotification"
+          },
+          "active_transaction": {
+            "type": "boolean",
+            "description": "Whether a charging transaction is currently active"
+          },
+          "energy_wh": {
+            "type": "string",
+            "description": "Cumulative energy delivered (Wh) from latest MeterValues",
+            "example": "15234"
+          },
+          "power_w": {
+            "type": "string",
+            "description": "Current power draw (W) from latest MeterValues",
+            "example": "22000"
+          },
+          "soc_percent": {
+            "type": "string",
+            "description": "State of Charge (%) from latest MeterValues, if reported by vehicle",
+            "example": "48"
+          },
+          "meter_timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp of the last MeterValues reading"
+          }
+        }
+      }
+    }
+  }
+}
