@@ -29,6 +29,7 @@ EV Chargers (OCPP 1.6-J / 2.0.1)
                                        |                      |
                                        |  GET /chargers       |
                                        |  GET /chargers/{id}  |
+                                       |  GET /sessions       |
                                        +----------------------+
 ```
 
@@ -43,7 +44,9 @@ EV Chargers (OCPP 1.6-J / 2.0.1)
    - **Writes history** to PostgreSQL (append-only, `ON CONFLICT DO NOTHING`)
    - **Updates latest state** in Redis with a **timestamp guard** — only applies the update if the event timestamp is newer than what's stored
 
-4. **Serve.** The REST API reads from Redis to return the composite latest state per charger.
+4. **Build CDRs.** On `StopTransaction`, the state-processor pairs it with the corresponding `StartTransaction` (cached in Redis) to create a Charge Detail Record (CDR) — charger, connector, duration, energy consumed, stop reason — and writes it to PostgreSQL.
+
+5. **Serve.** The REST API reads latest state from Redis and completed sessions from PostgreSQL.
 
 ## Data Model
 
@@ -70,6 +73,17 @@ charger:{id}:conn:{n}   -> { status, error_code, energy_wh, power_w, soc_percent
 charger:{id}:connectors -> SET of connector IDs
 chargers                -> SET of all charger IDs
 ```
+
+**Charge Detail Records** (PostgreSQL, one row per completed session):
+
+```
+charge_sessions:
+  session_id, charger_id, connector_id, id_tag,
+  start_time, end_time, duration_sec,
+  energy_wh, meter_start, meter_stop, stop_reason
+```
+
+Built automatically by pairing `StartTransaction` and `StopTransaction` events. Start data is cached in Redis (`tx:active:{chargerID}`) during the session.
 
 ## Handling Duplicates and Out-of-Order Events
 

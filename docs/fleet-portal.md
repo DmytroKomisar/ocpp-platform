@@ -44,6 +44,27 @@ Click any charger card to drill down. Shows:
   - SoC percentage with progress bar
   - Status-since and meter-updated relative timestamps
 
+### Charging Sessions (`/dashboard/sessions`)
+
+Live-updating table of completed charging sessions (CDRs). Newest sessions appear at the top with a subtle highlight animation.
+
+| Column | Description |
+|--------|-------------|
+| Ended | Time the session ended |
+| Charger | Charger ID (clickable — navigates to charger detail) |
+| Conn | Connector number |
+| Duration | Session length (e.g., `3m 5s`) |
+| Energy | Total energy delivered (e.g., `4.9 kWh`) |
+| ID Tag | RFID tag used for authorization |
+| Stop Reason | Why the session ended, color-coded badge |
+
+**Stop reason colors:**
+- Green: `EVDisconnected` (normal — driver unplugged)
+- Blue: `Local` (stopped at the charger)
+- Yellow: `Remote` (stopped remotely via CSMS)
+
+Data source: `GET /sessions` endpoint querying the `charge_sessions` table in PostgreSQL.
+
 ## Live Updates
 
 - Fleet view polls `GET /chargers` every **5 seconds**

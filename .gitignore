@@ -5,6 +5,9 @@
 *.dylib
 /service
 /api
+/cp-simulator
+/state-processor
+/wsgw
 
 # Go
 /vendor/

@@ -15,7 +15,9 @@ curl http://localhost:8081/chargers
 | URL | What |
 |-----|------|
 | [localhost:8081/chargers](http://localhost:8081/chargers) | REST API — fleet state |
+| [localhost:8081/sessions](http://localhost:8081/sessions) | REST API — completed charging sessions (CDRs) |
 | [localhost:8081/dashboard/](http://localhost:8081/dashboard/) | Fleet Monitoring Portal (live) |
+| [localhost:8081/dashboard/sessions](http://localhost:8081/dashboard/sessions) | Charging Sessions / CDR log (live) |
 | [localhost:8081/swagger/](http://localhost:8081/swagger/) | Swagger UI (OpenAPI 3.0) |
 | [localhost:3000](http://localhost:3000) | Grafana dashboards (`admin` / `spirii`) |
 | [localhost:9090](http://localhost:9090) | Prometheus |
@@ -36,6 +38,7 @@ curl http://localhost:8081/chargers
 |----------|-------------|
 | [docs/fleet-portal.md](docs/fleet-portal.md) | Fleet Monitoring Portal — features, status colors, tech details |
 | [docs/fleet-portal-spec.md](docs/fleet-portal-spec.md) | Fleet Portal technical specification |
+| [CHANGELOG.md](CHANGELOG.md) | Release notes and version history |
 
 ## Architecture Reference
 

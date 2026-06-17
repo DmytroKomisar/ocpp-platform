@@ -45,18 +45,40 @@ docker compose down -v
 
 ## Simulated Charger Behavior
 
-The `cp-simulator` creates 50 chargers (`SPI-00001` through `SPI-00050`), each with 2 connectors. Each charger runs a realistic OCPP session lifecycle:
+The `cp-simulator` creates 50 chargers (`SPI-00001` through `SPI-00050`), each with 2 connectors. The fleet simulates realistic utilization patterns — most chargers are idle (Available) at any given time, with ~20-30% actively in a charging session.
+
+**10 charger models** with varying power ratings:
+
+| Vendor | Model | Max Power |
+|--------|-------|-----------|
+| Spirii | S3-50kW | 50 kW |
+| Spirii | S5-150kW | 150 kW |
+| ABB | Terra 54 | 50 kW |
+| ABB | Terra 124 | 120 kW |
+| Kempower | S-Series | 40 kW |
+| Alfen | Eve Single S-line | 22 kW |
+| Alfen | Eve Double Pro-line | 22 kW |
+| Easee | Charge | 22 kW |
+| Zaptec | Go | 22 kW |
+
+**Session lifecycle:**
 
 ```
 BootNotification -> StatusNotification (Available)
-  -> StatusNotification (Preparing)
+  -> [idle 30s-3min, heartbeats continue]
+  -> ~25% chance: start a session
+    -> StatusNotification (Preparing)
+      -> 5% chance: driver doesn't authorize -> back to Available
     -> StartTransaction
       -> StatusNotification (Charging)
         -> MeterValues (energy, power, SoC) every 10s
+        -> 3% chance: SuspendedEV (vehicle pauses temporarily)
+        -> Power tapers as SoC increases (realistic charging curve)
       -> StatusNotification (Finishing)
-    -> StopTransaction
+      -> [driver unplugs 5-30s later]
+    -> StopTransaction (reason: EVDisconnected / Local / Remote)
   -> StatusNotification (Available)
--> idle 5-15s -> repeat on random connector
+  -> repeat
 ```
 
 Heartbeats are sent every 30 seconds throughout.
@@ -115,6 +137,24 @@ $ curl -s http://localhost:8081/chargers/SPI-00003/state | jq
 }
 ```
 
+**Completed sessions (CDRs):**
+```bash
+$ curl -s http://localhost:8081/sessions?limit=3 | jq '.sessions[0]'
+{
+  "session_id": "01eebb02-1217-44ae-a056-512f08b1aeaf",
+  "charger_id": "SPI-00021",
+  "connector_id": 1,
+  "id_tag": "RFID-ada9bd63",
+  "start_time": "2026-06-16T15:29:46Z",
+  "end_time": "2026-06-16T15:32:51Z",
+  "duration_sec": 185,
+  "energy_wh": 4890,
+  "meter_start": 4057,
+  "meter_stop": 8947,
+  "stop_reason": "EVDisconnected"
+}
+```
+
 ## Swagger UI
 
 The REST API includes an OpenAPI 3.0 specification and Swagger UI:
@@ -129,6 +169,7 @@ The spec documents all endpoints, request/response schemas (including `ChargerSt
 A real-time web dashboard for monitoring the entire charger fleet:
 
 - **Fleet Portal:** [http://localhost:8081/dashboard/](http://localhost:8081/dashboard/)
+- **Charging Sessions (CDRs):** [http://localhost:8081/dashboard/sessions](http://localhost:8081/dashboard/sessions)
 
 See [docs/fleet-portal.md](fleet-portal.md) for full documentation.
 
